@@ -1,71 +1,68 @@
 import torch
+import matplotlib.pyplot as plt
 import torch.nn as nn
 from torch.nn import functional as F
 
-# Hyperparamters
-batch_size = 32 # Number of independent sequences that we will process in parallel.
-block_size = 8 # Maximum context length for predictions.
-max_iters = 6000
-eval_interval = 600
-learning_rate = 1e-3
+# Hyperparameters
+batch_size = 32
+block_size = 8
+max_iters = 18000
+eval_interval = 300
+learning_rate = 1e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f"Using device: {device}")
+if device == 'cuda':
+    print(torch.cuda.get_device_name(0))
 eval_iters = 400
-n_embd = 32
- 
+n_embd = 64
+
+
+
 #_______________________________________________________________________
 
 torch.manual_seed(1337)
 
-# wget https://raw.githubusercontent.com/rajdangi31/GPT-2/refs/heads/main/Plato.txt
-
-with open('Plato.txt' , 'r' , encoding='utf-8') as f:
+with open('Plato.txt', 'r', encoding='utf-8') as f:
     text = f.read()
 
-# Unique characters that occur in the text.
-
+# Tokenization
 chars = sorted(list(set(text)))
 vocab_size = len(chars)
+stoi = {ch: i for i, ch in enumerate(chars)}
+itos = {i: ch for i, ch in enumerate(chars)}
+encode = lambda s: [stoi[c] for c in s]
+decode = lambda l: ''.join([itos[i] for i in l])
 
-# Creating a mapping from characters to integers. {TOKENIZATION}
-
-stoi = { ch:i for i,ch in enumerate(chars) }
-itos = { i:ch for i,ch in enumerate(chars) }
-encode = lambda s: [stoi[c] for c in s] # Encoder - takes a string & outputs a list of integeres.
-decode = lambda l: ''.join([itos[i] for i in l]) # Decoder - takes a list of integers, outputs a string.
-
-# Train and splits
+# Data split
 data = torch.tensor(encode(text), dtype=torch.long)
-n = int(0.9*len(data)) # First 90% of the data is going to be for training, and the remaining will be for valuation.
+n = int(0.9 * len(data))
 train_data = data[:n]
 val_data = data[n:]
 
-# Data Loading
+# Data loading
 def get_batch(split):
-
-    # Generate a small batch of inputs x and targets y
     data = train_data if split == 'train' else val_data
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([data[i: i + block_size] for i in ix])
-    y = torch.stack([data[i + 1 : i + block_size+1] for i in ix])
-    x, y = x.to(device), y.to(device)
-    return x, y
+    y = torch.stack([data[i + 1: i + block_size + 1] for i in ix])
+    return x.to(device), y.to(device)
 
 @torch.no_grad()
 def estimate_loss():
     out = {}
     model.eval()
-    for split in ['train' , 'val']:
+    for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
-            logits, loss = model(X, Y)
+            _, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
     return out
 
-class Head(nn.Module):
 
+class Head(nn.Module):
     def __init__(self, head_size):
         super().__init__()
         self.key = nn.Linear(n_embd, head_size, bias=False)
@@ -75,141 +72,140 @@ class Head(nn.Module):
 
     def forward(self, x):
         B, T, C = x.shape
-        k = self.key(x) # (B, T, C)
-        q = self.query(x) # (B, T, C)
-
-        # Computing attention scores
-        wei = q @ k.transpose(-2, -1) * C** -0.5 # (B, T, C) @ (B, C, T) --> (B, T, T)
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
-        wei = F.softmax(wei, dim=-1) # (B, T, T)
-
-        # Perform the weighted aggregation of the values
-        v = self.value(x) # (B, T, C)
-        out = wei @ v # (B, T, C) @ (B, T, C) --> (B, T, C)
+        k, q = self.key(x), self.query(x)
+        wei = q @ k.transpose(-2, -1) * (k.shape[-1] ** -0.5)
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
+        wei = F.softmax(wei, dim=-1)
+        v = self.value(x)
+        out = wei @ v
         return out
-    
-class MultiHeadAttention(nn.Module):
 
+
+class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range (num_heads)])
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(0.0)
 
     def forward(self, x):
-        return torch.cat([h(x) for h in self.heads], dim=-1)
-    
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.dropout(self.proj(out))
+        return out
+
 
 class FeedForward(nn.Module):
-
     def __init__(self, n_embd):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_embd, n_embd),
+            nn.Linear(n_embd, 4 * n_embd),
             nn.ReLU(),
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(0.0),
         )
 
     def forward(self, x):
         return self.net(x)
-    
+
 
 class Block(nn.Module):
-    """ Transformer Block : Communication followed by computation"""
-    
     def __init__(self, n_embd, n_head):
-        # n_embd : Embedding dimension, n_head: the number of heads we'd like
         super().__init__()
         head_size = n_embd // n_head
         self.sa = MultiHeadAttention(n_head, head_size)
         self.ffwd = FeedForward(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
 
     def forward(self, x):
-        x = self.sa(x)
-        x = self.ffwd(x)
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
         return x
 
-# Simplistic Bigram Model
-class BigramLanguageModel(nn.Module):
 
+class BigramLanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
-
-        # Token reading off the logits for the next token from a lookup table of vocab_size * vocab_size 
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
         self.blocks = nn.Sequential(
             Block(n_embd, n_head=4),
             Block(n_embd, n_head=4),
-            Block(n_embd, n_head=4),
+            nn.LayerNorm(n_embd),
         )
-        self.sa_heads = MultiHeadAttention(4, n_embd//4) # 4 Heads of 8-Dimenstional self-attention
-        self.ffwd = FeedForward(n_embd)
         self.ln_head = nn.Linear(n_embd, vocab_size)
 
-    def forward(self, idx, targets = None):
-        
+    def forward(self, idx, targets=None):
         B, T = idx.shape
-        
-        # idx and targets are both (B , T) tensor of integers
-        tok_emb = self.token_embedding_table(idx) # (B, T, C)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T, C)
-        x = tok_emb + pos_emb # (B, T, C)
-        x = self.sa_heads(x) # Applying one head of self-attention. (B, T, C)
-        x = self.ffwd(x) # (B, T, C)
-        logits = self.ln_head(x) # (B, T, vocab_size)
+        tok_emb = self.token_embedding_table(idx)
+        pos_emb = self.position_embedding_table(torch.arange(T, device=device))
+        x = tok_emb + pos_emb
+        x = nn.Dropout(0.0)(x)
+        x = self.blocks(x)
+        logits = self.ln_head(x)
 
         if targets is None:
-            loss = None
-        else:
-            B , T , C = logits.shape
-            logits = logits.view(B*T, C)
-            targets = targets.view(B*T)
-            loss = F.cross_entropy(logits, targets)
-        
+            return logits, None
+
+        B, T, C = logits.shape
+        loss = F.cross_entropy(
+            logits.view(B * T, C),
+            targets.view(B * T),
+            label_smoothing=0.1,
+        )
         return logits, loss
-    
+
     def generate(self, idx, max_new_tokens):
-        # idx is (B, T) array of indices in the current context
         for _ in range(max_new_tokens):
-
-            # Crop idx to the last block_size tokens
             idx_cond = idx[:, -block_size:]
-
-            # Getting the predictions
-            logits , loss = self(idx_cond)
-
-            # Focus only on the last time step
-            logits = logits[:, -1, :] # Becomes (B, C)
-
-            # Apply softmax to get probabilities
-            probs = F.softmax(logits, dim = -1) #(B, C)
-
-            # Sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
-
-            # Appending sampled index to the running sequence
-            idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
+            logits, _ = self(idx_cond)
+            logits = logits[:, -1, :]
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, idx_next), dim=1)
         return idx
-    
-model = BigramLanguageModel()
-m = model.to(device)
 
-# Create a PyTorch optimizer
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
+# Training setup
+model = BigramLanguageModel().to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.0)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_iters)
+
+train_losses, val_losses = [], []
+best_val_loss = float('inf')
+patience, counter = 10, 0
+
+# Training loop
 for iter in range(max_iters):
-    # Every once in a while evaluate the loss on train and evaluation sets
     if iter % eval_interval == 0:
         losses = estimate_loss()
         print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        train_losses.append(losses['train'])
+        val_losses.append(losses['val'])
 
-    # Sampling a batch of data
-    xb , yb = get_batch('train')
+        if losses['val'] < best_val_loss:
+            best_val_loss = losses['val']
+            counter = 0
+        else:
+            counter += 1
+            if counter >= patience:
+                print(f"Early stopping at step {iter}")
+                break
 
-    # Evaluate the loss
-    logits, loss = model(xb, yb)
+    xb, yb = get_batch('train')
+    _, loss = model(xb, yb)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step()
+    scheduler.step()
 
-# Generate from the model
+# Plot losses
+plt.plot(train_losses, label='Train')
+plt.plot(val_losses, label='Val')
+plt.legend()
+plt.show()
+
+# Generate text
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
-print(decode(m.generate(context, max_new_tokens = 500)[0].tolist()))
+print(decode(model.generate(context, max_new_tokens=500)[0].tolist()))
